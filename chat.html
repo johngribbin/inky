@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inkling 2 Mini</title>
+<style>
+:root { --bg:#fafafa; --fg:#1d1d1f; --muted:#6e6e73; --card:#fff; --border:#e2e2e6; --accent:#2f6fed; --code:#f2f2f5; --user:#eaf0fd; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161618; --fg:#ececef; --muted:#9a9aa2; --card:#1f1f22; --border:#2e2e33; --accent:#6b9bff; --code:#2a2a2f; --user:#22304d; } }
+* { box-sizing: border-box; }
+html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; }
+body { display:flex; flex-direction:column; }
+header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--card); }
+header h1 { font-size:15px; margin:0; font-weight:600; flex:1; }
+header label { color:var(--muted); font-size:13px; }
+select, button, textarea { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--border); border-radius:8px; }
+select { padding:4px 8px; }
+button { padding:6px 14px; cursor:pointer; }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+#log { flex:1; overflow-y:auto; padding:16px; }
+.msg { max-width:860px; margin:0 auto 16px; }
+.bubble { padding:10px 14px; border-radius:12px; background:var(--card); border:1px solid var(--border); overflow-wrap:anywhere; }
+.user .bubble { background:var(--user); border-color:transparent; white-space:pre-wrap; }
+.role { font-size:12px; color:var(--muted); margin-bottom:4px; }
+details.think { margin-bottom:8px; color:var(--muted); font-size:13px; }
+details.think summary { cursor:pointer; }
+details.think div { white-space:pre-wrap; padding:6px 0 0 12px; border-left:2px solid var(--border); margin-top:6px; }
+.content p { margin:0 0 8px; } .content p:last-child { margin-bottom:0; }
+pre { background:var(--code); padding:10px 12px; border-radius:8px; overflow-x:auto; font-size:13px; }
+code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:13px; }
+:not(pre) > code { background:var(--code); padding:1px 5px; border-radius:4px; }
+.stats { font-size:12px; color:var(--muted); margin-top:4px; }
+form { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--border); background:var(--card); }
+form > div { max-width:860px; margin:0 auto; width:100%; display:flex; gap:8px; align-items:flex-end; }
+textarea { flex:1; resize:none; padding:8px 10px; min-height:42px; max-height:40vh; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Inkling 2 Mini</h1>
+  <label for="effort">Reasoning</label>
+  <select id="effort">
+    <option>none</option><option>minimal</option><option selected>low</option><option>medium</option>
+    <option>high</option><option>xhigh</option><option>max</option>
+  </select>
+  <button id="clear" type="button">New chat</button>
+</header>
+<div id="log"></div>
+<form id="f"><div>
+  <textarea id="input" rows="1" placeholder="Message Inkling (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" class="primary" type="submit">Send</button>
+</div></form>
+<script>
+let MODEL = "inkling-2-mini:latest";
+const log = document.getElementById("log"), input = document.getElementById("input"),
+      sendBtn = document.getElementById("send"), effortSel = document.getElementById("effort");
+let history = [], controller = null;
+
+fetch("/ui-config.json").then(r => r.json()).then(cfg => {
+  MODEL = cfg.model || MODEL;
+  let saved = null; try { saved = localStorage.getItem("inkling-effort"); } catch {}
+  effortSel.value = saved || cfg.effort || "low";
+}).catch(() => {});
+effortSel.onchange = () => { try { localStorage.setItem("inkling-effort", effortSel.value); } catch {} };
+
+const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function md(src) {
+  const parts = src.split(/```/);
+  return parts.map((p, i) => {
+    if (i % 2) { const nl = p.indexOf("\n"); return "<pre><code>" + esc(nl >= 0 ? p.slice(nl + 1) : p) + "</code></pre>"; }
+    return esc(p).replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .split(/\n{2,}/).map(b => b.trim() ? "<p>" + b.replace(/\n/g, "<br>") + "</p>" : "").join("");
+  }).join("");
+}
+function add(role) {
+  const m = document.createElement("div"); m.className = "msg " + role;
+  m.innerHTML = `<div class="role">${role === "user" ? "You" : "Inkling"}</div><div class="bubble"></div>`;
+  log.appendChild(m); return m;
+}
+const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+
+async function send(text) {
+  history.push({ role: "user", content: text });
+  add("user").querySelector(".bubble").textContent = text;
+  const m = add("assistant"), bubble = m.querySelector(".bubble");
+  bubble.innerHTML = '<details class="think" hidden><summary>Thinking…</summary><div></div></details><div class="content"></div>';
+  const think = bubble.querySelector(".think"), thinkBody = think.querySelector("div"), content = bubble.querySelector(".content");
+  let reasoning = "", answer = "", tokens = 0, t0 = performance.now(), tFirst = null;
+  controller = new AbortController(); sendBtn.textContent = "Stop";
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: MODEL, messages: history, stream: true, reasoning_effort: effortSel.value }) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim(); if (data === "[DONE]") continue;
+        const d = JSON.parse(data).choices?.[0]?.delta || {};
+        const rs = d.reasoning || d.reasoning_content || "", c = d.content || "";
+        if (!rs && !c) continue;
+        tFirst ??= performance.now(); tokens++;
+        const stick = atBottom();
+        if (rs) { reasoning += rs; think.hidden = false; thinkBody.textContent = reasoning; }
+        if (c) { answer += c; content.innerHTML = md(answer); }
+        if (stick) log.scrollTop = log.scrollHeight;
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") content.innerHTML += `<p style="color:#d33">${esc(String(e.message || e))}</p>`;
+  }
+  const secs = (performance.now() - (tFirst ?? t0)) / 1000;
+  think.querySelector("summary").textContent = `Thought (${reasoning.length ? reasoning.split(/\s+/).length + " words" : "none"})`;
+  const s = document.createElement("div"); s.className = "stats";
+  s.textContent = `${tokens} tokens · ${(tokens / Math.max(secs, 0.01)).toFixed(1)} tok/s · first token ${((tFirst ?? t0) - t0) / 1000 > 0 ? (((tFirst ?? t0) - t0) / 1000).toFixed(2) : "–"} s · effort ${effortSel.value}`;
+  m.appendChild(s);
+  history.push({ role: "assistant", content: answer });
+  controller = null; sendBtn.textContent = "Send"; input.focus();
+}
+
+document.getElementById("f").onsubmit = e => {
+  e.preventDefault();
+  if (controller) { controller.abort(); return; }
+  const t = input.value.trim(); if (!t) return;
+  input.value = ""; input.style.height = ""; send(t);
+};
+input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("f").requestSubmit(); } });
+input.addEventListener("input", () => { input.style.height = ""; input.style.height = input.scrollHeight + "px"; });
+document.getElementById("clear").onclick = () => { if (controller) controller.abort(); history = []; log.innerHTML = ""; input.focus(); };
+input.focus();
+</script>
+</body>
+</html>

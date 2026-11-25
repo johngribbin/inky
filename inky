@@ -1,0 +1,129 @@
+#!/bin/zsh
+# inky — run Inkling 2 Mini locally on Apple Silicon, fast.
+#
+# Starts a private Ollama instance (MLX runner, official NVFP4/MXFP8 weights + DSpark
+# speculative draft) behind a small proxy that serves a chat UI and an OpenAI-compatible
+# API with a sensible default reasoning effort.
+#
+# Usage:
+#   inky                start (or open the chat UI if already running)
+#   inky use <model>     download a model if needed and make it the default
+#   inky models          list downloaded models and the current default
+#
+# Every setting can be overridden with an environment variable, e.g.
+#   INKY_EFFORT=high inky
+#   INKY_PORT=9000 INKY_CTX=65536 inky
+
+PORT=${INKY_PORT:-8089}                    # chat UI + API port
+BACKEND_PORT=${INKY_BACKEND_PORT:-11435}   # private Ollama instance (the Ollama app keeps 11434)
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/inky/model   # saved by "inky use"
+DEFAULT_MODEL=inkling-2-mini:latest
+MODEL=${INKY_MODEL:-$(cat "$CONFIG" 2>/dev/null)}
+MODEL=${MODEL:-$DEFAULT_MODEL}               # any Ollama model works
+CTX=${INKY_CTX:-32768}                     # context length; the model supports 1M but KV cache grows with it
+EFFORT=${INKY_EFFORT:-low}                 # none|minimal|low|medium|high|xhigh|max, or "default" to not inject
+OPEN_BROWSER=${INKY_OPEN:-1}               # 0 = don't open the chat UI on start
+
+DIR=${0:A:h}
+LOGS=${XDG_STATE_HOME:-$HOME/.local/state}/inky
+mkdir -p "$LOGS"
+UI="http://127.0.0.1:$PORT/"
+
+command -v ollama >/dev/null || { echo "Ollama not found. Install it from https://ollama.com/download"; exit 1; }
+
+# Temporary private Ollama for "use" / "models" (doesn't touch the Ollama app)
+tmp_ollama() {
+  TMP_PORT=11439
+  OLLAMA_HOST=127.0.0.1:$TMP_PORT OLLAMA_NOPRUNE=1 OLLAMA_NO_CLOUD=1 ollama serve >/dev/null 2>&1 &
+  TMP_PID=$!
+  until curl -s "http://127.0.0.1:$TMP_PORT/api/version" >/dev/null; do
+    kill -0 $TMP_PID 2>/dev/null || { echo "Couldn't start Ollama."; exit 1; }; sleep 0.5
+  done
+  export OLLAMA_HOST=127.0.0.1:$TMP_PORT
+}
+# (zsh runs an EXIT trap set inside a function when the function returns, so set it out here)
+
+case $1 in
+  use)
+    [[ -n $2 ]] || { cat <<USE
+Usage: ${0:t} use <model>
+
+Examples:
+  ${0:t} use inkling-2-mini              official build (recommended, fastest on Mac)
+  ${0:t} use hf.co/<user>/<repo>:Q8_0    a community GGUF from Hugging Face
+  ${0:t} use default                     go back to $DEFAULT_MODEL
+
+Community GGUF builds run on Ollama's llama.cpp engine rather than MLX, so expect
+them to be slower, and not every upload supports this model's architecture.
+USE
+      exit 1; }
+    want=$2; [[ $want == default ]] && want=$DEFAULT_MODEL
+    [[ $want == *:* ]] || want=$want:latest
+    tmp_ollama; trap 'kill $TMP_PID 2>/dev/null' EXIT
+    if ! ollama show "$want" >/dev/null 2>&1; then
+      echo "Downloading $want ..."
+      ollama pull "$want" || { echo "Download failed. Check the name (ollama.com/library or hf.co/<user>/<repo>:<quant>)."; exit 1; }
+    fi
+    mkdir -p "${CONFIG:h}"; echo "$want" > "$CONFIG"
+    echo "Default model is now $want. Restart ${0:t} to use it."
+    exit 0 ;;
+  models)
+    tmp_ollama; trap 'kill $TMP_PID 2>/dev/null' EXIT
+    echo "Current default: $MODEL"; echo; ollama list
+    exit 0 ;;
+  help|-h|--help)
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "Unknown command: $1  (try: ${0:t} help)"; exit 1 ;;
+esac
+
+if curl -sf -m 1 "http://127.0.0.1:$PORT/ui-config.json" 2>/dev/null | grep -q '"model"'; then
+  echo "Already running. Chat UI: $UI   API: http://127.0.0.1:$PORT/v1"
+  [[ $OPEN_BROWSER == 1 ]] && open "$UI"
+  exit 0
+fi
+if /usr/sbin/lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port $PORT is used by another program. Pick another: INKY_PORT=9000 ${0:t}"; exit 1
+fi
+
+OLLAMA_HOST=127.0.0.1:$BACKEND_PORT OLLAMA_CONTEXT_LENGTH=$CTX OLLAMA_NUM_PARALLEL=1 \
+OLLAMA_KEEP_ALIVE=-1 OLLAMA_NOPRUNE=1 OLLAMA_NO_CLOUD=1 \
+  ollama serve > "$LOGS/ollama.log" 2>&1 &
+OLLAMA_PID=$!
+trap 'kill $PROXY_PID $OLLAMA_PID 2>/dev/null; echo; echo "Stopped."' INT TERM EXIT
+
+until curl -s "http://127.0.0.1:$BACKEND_PORT/api/version" >/dev/null; do
+  kill -0 $OLLAMA_PID 2>/dev/null || { echo "Ollama failed to start. See $LOGS/ollama.log"; exit 1; }
+  sleep 0.5
+done
+if ! OLLAMA_HOST=127.0.0.1:$BACKEND_PORT ollama show "$MODEL" >/dev/null 2>&1; then
+  echo "Model $MODEL is not downloaded. Run:  ${0:t} use ${MODEL%:latest}"; exit 1
+fi
+# Only inject a reasoning effort for models that support thinking
+OLLAMA_HOST=127.0.0.1:$BACKEND_PORT ollama show "$MODEL" 2>/dev/null | grep -q -w thinking || EFFORT=default
+
+PROXY_LISTEN=127.0.0.1:$PORT UPSTREAM=http://127.0.0.1:$BACKEND_PORT \
+INKY_MODEL=$MODEL INKY_EFFORT=$EFFORT \
+  python3 -I "$DIR/proxy.py" > "$LOGS/proxy.log" 2>&1 &
+PROXY_PID=$!
+
+echo "Loading $MODEL..."
+curl -s "http://127.0.0.1:$BACKEND_PORT/api/generate" -d "{\"model\":\"$MODEL\",\"keep_alive\":-1}" >/dev/null
+
+cat <<MSG
+
+Inkling is ready  (reasoning effort: $EFFORT, context: $CTX)
+
+  Chat in your browser:  $UI
+
+  For coding agents (OpenAI-compatible):
+    Base URL:  http://127.0.0.1:$PORT/v1
+    Model:     $MODEL
+    API key:   any value (e.g. "local")
+    Optional:  send "reasoning_effort": "high" per request to think harder
+
+Logs: $LOGS
+Ctrl+C to stop.
+MSG
+[[ $OPEN_BROWSER == 1 ]] && open "$UI"
+wait $OLLAMA_PID
