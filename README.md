@@ -2,6 +2,11 @@
 
 Run [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Thinking Machines Lab, 26.4B total / 3.4B active, looped MoE) locally on Apple Silicon, as fast as the hardware allows, with one command.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/ui-dark.png">
+  <img alt="The inky chat UI: a prompt asking for a palindrome function, Inkling's collapsed thinking, the code answer, and stats showing 41.5 tokens per second at low reasoning effort" src="docs/ui-light.png">
+</picture>
+
 ```
 $ inky
 
