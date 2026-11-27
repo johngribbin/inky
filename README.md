@@ -121,7 +121,7 @@ inky is plain shell, Python and HTML with no dependencies, so you can read all o
 
 - **Sampling:** the official `generation_config` sets only `temperature: 1.0`. Nothing else is tuned.
 - **Precision:** the weights are natively NVFP4 and MXFP8. "8-bit" community conversions upcast from that, so they add no quality and run slower.
-- **Effort:** even at `none` the model still thinks a little, and the looped middle layers run three times per token regardless.
+- **Effort:** the template's `none` is only "effort level 0": the model still thinks, and Ollama then drops that thinking from the reply, so a client pays for tokens it can't see or stop. inky makes `none` mean **no thinking**: for plain-text chats with an Inkling model the proxy writes the prompt itself and opens the model's turn as text, so it answers straight away. Trade-off: with no thinking at all, answers that need reasoning get worse (it gets simple arithmetic wrong); use `minimal` for a little thinking. Requests with tools or images go to Ollama unchanged. The looped middle layers run three times per token regardless.
 - **Loops:** the model can get stuck in long reasoning loops, especially when debugging code. Cap `max_tokens` and agent turns.
 
 ## Benchmarks
@@ -151,7 +151,7 @@ python3 bench/bench.py http://127.0.0.1:8089/v1 inkling-2-mini:latest low --long
 
 - `setup.sh` / `uninstall.sh`: install and remove
 - `inky`: the launcher (settings at the top)
-- `proxy.py`: stdlib-only proxy that serves the UI and injects the default effort
+- `proxy.py`: stdlib-only proxy that serves the UI, injects the default effort and answers `none` without thinking
 - `chat.html`: the chat UI, a single file with no dependencies
 - `bench/bench.py`: benchmark for any OpenAI-compatible endpoint
 
